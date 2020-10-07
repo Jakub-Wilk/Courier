@@ -4,12 +4,11 @@ from flask_pymongo import PyMongo
 from hashlib import sha256
 from base64 import urlsafe_b64encode
 from datetime import datetime
+from env import mongo_uri
 import bcrypt
 
 app = Flask(__name__)
-app.config[
-    "MONGO_URI"
-] = "mongodb://courier-api:CourierApi@couriercluster-shard-00-00.uxoop.mongodb.net:27017,couriercluster-shard-00-01.uxoop.mongodb.net:27017,couriercluster-shard-00-02.uxoop.mongodb.net:27017/courier-data?ssl=true&replicaSet=atlas-bmdura-shard-0&authSource=admin&retryWrites=true&w=majority"
+app.config["MONGO_URI"] = mongo_uri
 api = Api(app)
 mongo = PyMongo(app)
 
