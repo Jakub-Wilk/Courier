@@ -1,7 +1,7 @@
 from flask import Flask
 from flask_restful import reqparse, abort, Api, Resource
 from flask_pymongo import PyMongo
-from hashlib import sha256
+from hashlib import sha256, shake_256
 from base64 import urlsafe_b64encode
 from datetime import datetime
 from env import mongo_uri
@@ -35,7 +35,7 @@ class Auth(Resource):
         if delta.seconds // 60 >= 10:
             mongo.db.auth.delete_one({"key": access_key})
             abort(403, message=f"Access key {access_key} has expired!")
-        return 200
+        return query_result["user_id"]
 
     @staticmethod
     def check_update_access(access_key):
@@ -63,7 +63,7 @@ class Auth(Resource):
             mongo.db.auth.insert_one(
                 {
                     "key": key,
-                    "user": username,
+                    "user_id": user["_id"],
                     "date": datetime.now(),
                 }
             )
@@ -87,10 +87,48 @@ class Auth(Resource):
         return 200
 
 
+# class Post(Resource):
+#     post_parser = reqparse.RequestParser()
+#     post_parser.add_argument("content")
+#     post_parser.add_argument("user_id")
+
+#     def post_from_id(self, post_id):
+#         query_result = mongo.db.posts.find_one({"_id": post_id})
+#         return query_result
+
+#     def post_doesnt_exist(self, post_id):
+#         abort(404, message=f"Post {post_id} doesn't exist!")
+
+#     def get(self, post_id):
+#         post = self.post_from_id(post_id)
+#         if post is None:
+#             self.post_doesnt_exist(post_id)
+#         return post
+
+#     def put(self, post_id):
+#         args = self.post_parser.parse_args()
+#         post = {"_id": post_id, "content": args["content"], "user_id": args["user_id"]}
+#         if self.post_from_id(post_id) is None:
+#             mongo.db.posts.insert_one(post)
+#             return post, 201
+#         else:
+#             mongo.db.posts.update_one(
+#                 {"_id": post_id}, {"$set": {"content": args["content"]}}
+#             )
+#             return post
+
+#     def delete(self, post_id):
+#         if self.post_from_id(post_id) is None:
+#             self.post_doesnt_exist(post_id)
+#         mongo.db.posts.delete_one({"_id": post_id})
+#         return post_id
+
+
 class Post(Resource):
     post_parser = reqparse.RequestParser()
+    post_parser.add_argument("_id")
     post_parser.add_argument("content")
-    post_parser.add_argument("user_id")
+    post_parser.add_argument("key")
 
     def post_from_id(self, post_id):
         query_result = mongo.db.posts.find_one({"_id": post_id})
@@ -99,55 +137,63 @@ class Post(Resource):
     def post_doesnt_exist(self, post_id):
         abort(404, message=f"Post {post_id} doesn't exist!")
 
-    def get(self, post_id):
-        post = self.post_from_id(post_id)
-        if post is None:
-            self.post_doesnt_exist(post_id)
-        return post
-
-    def put(self, post_id):
-        args = self.post_parser.parse_args()
-        post = {"_id": post_id, "content": args["content"], "user_id": args["user_id"]}
-        if self.post_from_id(post_id) is None:
-            mongo.db.posts.insert_one(post)
-            return post, 201
-        else:
-            mongo.db.posts.update_one(
-                {"_id": post_id}, {"$set": {"content": args["content"]}}
-            )
-            return post
-
-    def delete(self, post_id):
-        if self.post_from_id(post_id) is None:
-            self.post_doesnt_exist(post_id)
-        mongo.db.posts.delete_one({"_id": post_id})
-        return post_id
-
-
-class PostCollection(Resource):
-    posts_parser = reqparse.RequestParser()
-    posts_parser.add_argument("_id")
-    posts_parser.add_argument("content")
-    posts_parser.add_argument("user_id")
-
     def get(self):
-        args = self.posts_parser.parse_args()
-        post = mongo.db.posts.find_one({"_id": args["_id"]})
+        args = self.post_parser.parse_args()
+        # user_id = Auth.check_access(args["key"])
+        post = self.post_from_id(args["_id"])
         if post is None:
-            abort(404, message=f"Post {args['_id']} doesn't exist!")
+            self.post_doesnt_exist(args["_id"])
         return post
 
     def post(self):
-        args = self.posts_parser.parse_args()
-        if mongo.db.posts.find_one({"_id": args["_id"]}) is None:
+        args = self.post_parser.parse_args()
+        user_id = Auth.check_access(args["key"])
+        if args["_id"] is None:
+            post_id = shake_256(
+                str(datetime.timestamp(datetime.now()), encoding="utf-8")
+                + str(user_id, encoding="utf-8")
+            ).hexdigest(8)
+            if self.post_from_id(post_id):
+                abort(409, message=f"Duplicate post ID {post_id}!")
+            args.update(
+                {
+                    "_id": int(
+                        post_id,
+                        16,
+                    ),
+                    "user_id": user_id,
+                }
+            )
             mongo.db.posts.insert_one(args)
-        else:
-            abort(409, message=f"Post {args['_id']} already exists!")
+            return args
+
+    def update(self):
+        args = self.post_parser.parse_args()
+        user_id = Auth.check_access(args["key"])
+        post = self.post_from_id(args["_id"])
+        if post is None:
+            self.post_doesnt_exist(post["_id"])
+        if user_id != post["user_id"]:
+            abort(401, f"User {user_id} not authorized to update post {post['_id']}")
+        mongo.db.posts.update_one(
+            {"_id": post["_id"], "$set": {"content": args["content"]}}
+        )
+        return 200
+
+    def delete(self):
+        args = self.post_parser.parse_args()
+        user_id = Auth.check_access(args["key"])
+        post = self.post_from_id(args["_id"])
+        if post is None:
+            self.post_doesnt_exist(post["_id"])
+        if user_id != post["_id"]:
+            abort(401, f"User {user_id} not authorized to delete post {post['_id']}")
+        mongo.db.posts.delete_one({"_id": post["_id"]})
+        return 200
 
 
 api.add_resource(Auth, "/auth")
-api.add_resource(Post, "/post/<post_id>")
-api.add_resource(PostCollection, "/post")
+api.add_resource(Post, "/post")
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0", port=8080)
