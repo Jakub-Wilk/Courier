@@ -1,11 +1,26 @@
+# Import potrzebnych elementów biblioteki Flask i rozszerzeń Flask Restful i Flask PyMongo
+
 from flask import Flask
 from flask_restful import reqparse, abort, Api, Resource
 from flask_pymongo import PyMongo
+
+# Import algorytmów kodujących i hashujących
+
+import bcrypt
 from hashlib import sha256, shake_256
 from base64 import urlsafe_b64encode
+
+# Import pozostałych bibliotek
+
 from datetime import datetime
+
+# Import tajnych danych (URI bazy MongoDB - zawiera ono nazwę użytkownika, hasło, nazwę bazy)
+
 from env import mongo_uri
-import bcrypt
+
+
+
+# Inicjalizacja aplikacji
 
 app = Flask(__name__)
 app.config["MONGO_URI"] = mongo_uri
@@ -13,148 +28,194 @@ api = Api(app)
 mongo = PyMongo(app)
 
 
+
 class Auth(Resource):
-    auth_parser = reqparse.RequestParser()
-    auth_parser.add_argument("username")
-    auth_parser.add_argument("password")
-    auth_parser.add_argument("access_key")
+    """
+        Klasa zawierająca funkcje związane z autentyfikacją użytkownika.
+    """
+    auth_parser = reqparse.RequestParser()  # Inicjalizacja parsera argumentów (pozwala na łatwiejsze przetwarzanie argumentów zapytania HTTP)
+    auth_parser.add_argument("action")      #  |
+    auth_parser.add_argument("username")    #  | Dodawanie argumentów do parsera
+    auth_parser.add_argument("password")    #  |
+    auth_parser.add_argument("key")         #  |
+
+
+    @staticmethod  # Metoda statyczna (można ją wykonać bez inicjalizacji obiektu)
+    def validate_key(access_key):
+        """
+            Ta metoda sprawdza czy dany klucz dostępu znajduje się w bazie danych.
+            Jeżeli klucz dostępu nie znajduje się w bazie, jest nieprawidłowy, a więc api przerywa zapytanie i zwraca kod HTTP 401: "Unauthorized".
+        """
+        if mongo.db.auth.find_one({"key": access_key}) is None:  # Jeśli takiego klucza nie ma w bazie
+            abort(401, message=f"Access key {access_key} is invalid!") # Zwróć 401: "Unauthorized"
+        return 200  #  Używam wartości 200 dlatego, że jest to kod HTTP "OK", co pozwala mi zwrócić później wartość zwrotną tej funkcji jako kod HTTP
+
 
     @staticmethod
-    def update_date(access_key):
-        if mongo.db.auth.find_one({"key": access_key}) is None:
-            abort(401, message=f"Access key {access_key} is invalid!")
-        mongo.db.auth.update_one({"key": access_key, "$set": {"date": datetime.now()}})
-        return 200
+    def reactivate(access_key):
+        """
+            Jeżeli podany klucz dostępu istnieje, ta metoda aktualizuje jego ostatnią godziną aktywacji (reaktywuje go).
+        """
+        if Auth.validate_key(access_key): # Jeśli taki klucz istnieje
+            mongo.db.auth.update_one(
+                {"key": access_key}, # Dla takiego klucza w bazie
+                {"$set": {"date": datetime.now()}} # Ustaw godzinę ostatniej aktywacji na aktualną godzinę
+            )
+            return 200
+
 
     @staticmethod
-    def check_access(access_key):
-        query_result = mongo.db.auth.find_one({"key": access_key})
-        if query_result is None:
-            abort(401, message=f"Access key {access_key} is invalid!")
-        delta = query_result["date"] - datetime.now()
-        if delta.seconds // 60 >= 10:
-            mongo.db.auth.delete_one({"key": access_key})
-            abort(403, message=f"Access key {access_key} has expired!")
-        return query_result["user_id"]
+    def check_if_active(access_key):
+        """
+            Ta metoda sprawdza, czy klucz dostępu jest aktywny.
+            Jeśli nie jest, usuwa go z bazy danych i zwraca kod HTTP 403: "Forbidden".
+        """
+        if Auth.validate_key(access_key): # Jeśli taki klucz istnieje
+            key_data = mongo.db.auth.find_one({"key": access_key}) # Ściągnij informacje o nim z bazy
+            delta = datetime.now() - key_data["date"] # Wylicz różnicę czasu pomiędzy aktualną godziną, a ostatnią reaktywacją
+            if delta.seconds // 60 >= 10: # Jeżeli minęło ponad 10 minut od ostatniej reaktywacji
+                mongo.db.auth.delete_one({"key": access_key}) # Usuń klucz z bazy
+                abort(403, message=f"Access key {access_key} has expired!") # Zwróć 403: "Forbidden"
+            return 200 # Jeśli nie minęło 10 minut, wszystko jest w porządku.
+
 
     @staticmethod
-    def check_update_access(access_key):
-        if Auth.check_access(access_key):
+    def check_and_reactivate(access_key):
+        """
+            Ta metoda to połączenie dwóch poprzednich. 
+            Sprawdza, czy dany klucz jest poprawny, a jeśli jest poprawny, reaktywuje go.
+        """
+        if Auth.check_if_active(access_key):
             return Auth.update_date(access_key)
 
-    def get(self):
-        args = self.auth_parser.parse_args()
-        username = args["username"]
-        password = args["password"]
-        if args["access_key"]:
-            return Auth.check_update_access(args["access_key"])
-        user = mongo.db.users.find_one({"username": username})
-        if user is None:
-            abort(404, message=f"User {username} doesn't exist!")
-        hashed_password = user["password"]
-        if bcrypt.checkpw(
-            urlsafe_b64encode(sha256(password.encode("utf-8")).digest()),
-            hashed_password,
-        ):
-            key = urlsafe_b64encode(
-                sha256(str(datetime.timestamp(datetime.now())).encode("utf-8")).digest()
-            ).decode("utf-8")
 
-            mongo.db.auth.insert_one(
-                {
-                    "key": key,
-                    "user_id": user["_id"],
-                    "date": datetime.now(),
-                }
-            )
-            return key
+    @staticmethod
+    def get_user_id(access_key):
+        """
+            Ta metoda zwraca ID użytkownika, dla którego wystawiony był klucz, jeśli klucz jest aktywny.
+        """
+        if Auth.check_and_reactivate(access_key):
+            return mongo.db.auth.find_one({"key": access_key})["user_id"]
+
 
     def post(self):
-        args = self.auth_parser.parse_args()
-        username = args["username"]
-        password = args["password"]
-        if mongo.db.users.find_one({"username": username}) is not None:
-            abort(409, message=f"A user with username {username} already exists!")
-        mongo.db.users.insert_one(
-            {
-                "username": username,
-                "password": bcrypt.hashpw(
-                    urlsafe_b64encode(sha256(password.encode("utf-8")).digest()),
-                    bcrypt.gensalt(),
-                ),
-            }
-        )
-        return 200
+        """
+            Ta metoda obsługuje zapytanie HTTP POST na endpoint autoryzacji.
+        """
+        args = self.auth_parser.parse_args() # Użyj parsera do przeczytania argumentów zapytania przesłanych przez klienta
+        action = args["action"]       # |
+        username = args["username"]   # | Przypisz zmienne argumentom
+        password = args["password"]   # |
 
 
-# class Post(Resource):
-#     post_parser = reqparse.RequestParser()
-#     post_parser.add_argument("content")
-#     post_parser.add_argument("user_id")
+        if action == "refresh": # Jeśli zapytanie to prośba o reaktywację klucza
+            if args["key"] is None: # Jeśli klucz nie został podany
+                abort(401, message="No access key received!") # Zwróć 401: "Unauthorized"
+            return Auth.check_and_reactivate(args["key"]) # Sprawdź poprawność klucza i reaktywuj go
 
-#     def post_from_id(self, post_id):
-#         query_result = mongo.db.posts.find_one({"_id": post_id})
-#         return query_result
 
-#     def post_doesnt_exist(self, post_id):
-#         abort(404, message=f"Post {post_id} doesn't exist!")
+        elif action ==  "login": # Jeśli zapytanie to prośba o zalogowanie
+            user = mongo.db.users.find_one({"username": username}) # Wyszukaj w bazie użytkownika o podanym nicku
+            if user is None: # Jeżeli takiego nie ma
+                abort(404, message=f"User {username} doesn't exist!") # Zwróć 404: "Not Found"
+            hashed_password = user["password"]
+            if bcrypt.checkpw(urlsafe_b64encode(sha256(password.encode("utf-8")).digest()), hashed_password): # Sprawdź, czy przesłane hasło po shashowaniu zgadza się ze shashowanym hasłem z bazy danych.
+                key = urlsafe_b64encode(
+                    sha256(
+                        str(datetime.timestamp(datetime.now())).encode("utf-8")
+                    ).digest()
+                ).decode("utf-8") # Utwórz nowy, losowy klucz dostępu
 
-#     def get(self, post_id):
-#         post = self.post_from_id(post_id)
-#         if post is None:
-#             self.post_doesnt_exist(post_id)
-#         return post
+                mongo.db.auth.insert_one(
+                    {
+                        "key": key,
+                        "user_id": user["_id"],
+                        "date": datetime.now(),
+                    }
+                ) # Dodaj klucz do bazy danych
+                return key # Zwróć ten klucz klientowi
 
-#     def put(self, post_id):
-#         args = self.post_parser.parse_args()
-#         post = {"_id": post_id, "content": args["content"], "user_id": args["user_id"]}
-#         if self.post_from_id(post_id) is None:
-#             mongo.db.posts.insert_one(post)
-#             return post, 201
-#         else:
-#             mongo.db.posts.update_one(
-#                 {"_id": post_id}, {"$set": {"content": args["content"]}}
-#             )
-#             return post
 
-#     def delete(self, post_id):
-#         if self.post_from_id(post_id) is None:
-#             self.post_doesnt_exist(post_id)
-#         mongo.db.posts.delete_one({"_id": post_id})
-#         return post_id
+        elif action == "register": # Jeśli zapytanie to prośba o zarejestrowanie użytkownika
+            if mongo.db.users.find_one({"username": username}) is not None: # Jeśli taki użytkownik już istnieje
+                abort(409, message=f"A user with username {username} already exists!") # Zwróć 409: "Conflict"
+            mongo.db.users.insert_one(
+                {
+                    "username": username,
+                    "password": bcrypt.hashpw(
+                        urlsafe_b64encode(sha256(password.encode("utf-8")).digest()),
+                        bcrypt.gensalt(),
+                    ),
+                } # Zapisz nazwę użytkownika i shashowane hasło w bazie
+            )
+            return 200
+
 
 
 class Post(Resource):
-    post_parser = reqparse.RequestParser()
+    """
+        Klasa zawierająca funkcje związane z manipulacją postów.
+    """
+    post_parser = reqparse.RequestParser() # Inicjalizacja parsera
     post_parser.add_argument("_id")
     post_parser.add_argument("content")
+    post_parser.add_argument("visibility")
     post_parser.add_argument("key")
 
     def post_from_id(self, post_id):
-        query_result = mongo.db.posts.find_one({"_id": post_id})
-        return query_result
+        """
+            Ta metoda wyszukuje dane posta na podstawie jego ID.
+        """
+        post = mongo.db.posts.find_one({"_id": post_id})
+        return post
+
+    def check_if_can_view(self, key, post_id):
+        """
+            Ta metoda sprawdza czy ten klucz dostępu pozwala na dostęp do tego posta.
+        """
+        user_id = Auth.get_user_id(key)
+        post = self.post_from_id(post_id)
+        if post["visibility"] == "private": # Jeśli post jest prywatny
+            if post["user_id"] == user_id:# or user_id in User.get_friends_list(post["user_id"]): # Tylko właściciel i jego przyjaciele mogą go widzieć
+                return 200
+            else: # Jeśli użytkownik nie jest w tej grupie
+                abort(401, message=f"User {user_id} is not authorized to view post {post_id}") # Zwróć 401: "Unauthorized"
+        else:
+            return 200
 
     def post_doesnt_exist(self, post_id):
+        """
+            Ta metoda zwraca 404: "Not Found".
+            Jest to po prostu skrót, by sobie oszczędzić pisania.
+        """
         abort(404, message=f"Post {post_id} doesn't exist!")
 
     def get(self):
-        args = self.post_parser.parse_args()
-        # user_id = Auth.check_access(args["key"])
+        """
+            Ta metoda obsługuje zapytanie HTTP GET na endpoint postów.
+            Zapytanie GET na ten endpoint służy do pobierania informacji o poście.
+        """
+        args = self.post_parser.parse_args() # Użyj parsera do przeczytania argumentów
         post = self.post_from_id(args["_id"])
-        if post is None:
+        if post is None: # Sprawdź, czy post o takim ID istnieje
             self.post_doesnt_exist(args["_id"])
-        return post
+        if self.check_if_can_view(args["key"], args["_id"]): # Jeśli klucz dostępu pozwala na wyświetlenie posta
+            return post # Zwróć posta
 
     def post(self):
-        args = self.post_parser.parse_args()
-        user_id = Auth.check_access(args["key"])
-        if args["_id"] is None:
+        """
+            Ta metoda obsługuje zapytanie HTTP POST na endpoint postów.
+            Zapytanie POST na ten endpoint służy do tworzenia nowego posta.
+        """
+        args = self.post_parser.parse_args() # Użyj parsera do przeczytania argumentów
+        user_id = Auth.get_user_id(args["key"]) # Zdobądź nazwę użytkownika
+        if args["_id"] is None: # Jeśli nie podano żadnego ID posta
             post_id = shake_256(
                 str(datetime.timestamp(datetime.now()), encoding="utf-8")
                 + str(user_id, encoding="utf-8")
-            ).hexdigest(8)
-            if self.post_from_id(post_id):
-                abort(409, message=f"Duplicate post ID {post_id}!")
+            ).hexdigest(8) # Utwórz nowe losowe ID posta
+            if self.post_from_id(post_id): # Jeśli wylosowane ID istnieje (niebotycznie mała szansa)
+                abort(409, message=f"Duplicate post ID {post_id}!") # Zwróć 409: "Conflict"
             args.update(
                 {
                     "_id": int(
@@ -163,37 +224,48 @@ class Post(Resource):
                     ),
                     "user_id": user_id,
                 }
-            )
-            mongo.db.posts.insert_one(args)
-            return args
+            ) # Dodaj ID i właściciela do informacji o poście
+            mongo.db.posts.insert_one(args) # Dodaj posta do bazy danych
+            return args # Zwróć informacje o utworzonym poście
 
     def update(self):
-        args = self.post_parser.parse_args()
-        user_id = Auth.check_access(args["key"])
+        """
+            Ta metoda obsługuje zapytanie HTTP UPDATE na endpoint postów.
+            Zapytanie UPDATE na ten endpoint służy do aktualizacji istniejącego posta.
+        """
+        args = self.post_parser.parse_args() # Użyj parsera do przeczytania argumentów
+        user_id = Auth.get_user_id(args["key"]) # Zdobądź nazwę użytkownika
         post = self.post_from_id(args["_id"])
-        if post is None:
+        if post is None: # Sprawdź, czy post o takim ID istnieje
             self.post_doesnt_exist(post["_id"])
-        if user_id != post["user_id"]:
-            abort(401, f"User {user_id} not authorized to update post {post['_id']}")
-        mongo.db.posts.update_one(
-            {"_id": post["_id"], "$set": {"content": args["content"]}}
-        )
+        if user_id != post["user_id"]: # Jeśli użytkownik nie jest właścicielem
+            abort(401, f"User {user_id} not authorized to update post {post['_id']}") # Zwróć 401: "Unauthorized"
+        mongo.db.posts.update_one({"_id": post["_id"], "$set": {"content": args["content"], "visibility": args["visibility"]}}) # Zaktualizuj dane posta
         return 200
 
     def delete(self):
-        args = self.post_parser.parse_args()
-        user_id = Auth.check_access(args["key"])
+        """
+            Ta metoda obsługuje zapytanie HTTP DELETE na endpoint postów.
+            Zapytanie DELETE służy do usuwania istniejącego posta.
+        """
+        args = self.post_parser.parse_args() # Użyj parsera do przeczytania argumentów
+        user_id = Auth.get_user_id(args["key"]) # Zdobądź nazwę użytkownika
         post = self.post_from_id(args["_id"])
-        if post is None:
+        if post is None: # Sprawdź, czy post o takim ID istnieje
             self.post_doesnt_exist(post["_id"])
-        if user_id != post["_id"]:
-            abort(401, f"User {user_id} not authorized to delete post {post['_id']}")
-        mongo.db.posts.delete_one({"_id": post["_id"]})
+        if user_id != post["_id"]: # Jeśli użytkownik nie jest właścicielem
+            abort(401, f"User {user_id} not authorized to delete post {post['_id']}") # Zwróć 401: "Unauthorized"
+        mongo.db.posts.delete_one({"_id": post["_id"]}) # Usuń posta
         return 200
 
+
+
+# Dodanie endpointów i przypisanie im klas
 
 api.add_resource(Auth, "/auth")
 api.add_resource(Post, "/post")
 
+# Uruchomienie serwera deweloperskiego, jeśli moduł jest uruchomiony jako skrypt
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8080)
+    app.run(debug=True, host="127.0.0.1", port=5000)

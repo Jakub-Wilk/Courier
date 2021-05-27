@@ -1,9 +1,0 @@
-README.rst
-setup.py
-courier/__init__.py
-courier/courier.py
-courier.egg-info/PKG-INFO
-courier.egg-info/SOURCES.txt
-courier.egg-info/dependency_links.txt
-courier.egg-info/requires.txt
-courier.egg-info/top_level.txt
