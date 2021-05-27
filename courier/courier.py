@@ -162,11 +162,13 @@ class Post(Resource):
     post_parser.add_argument("visibility")
     post_parser.add_argument("key")
 
-    def post_from_id(self, post_id):
+    def get_post_from_id(self, post_id):
         """
             Ta metoda wyszukuje dane posta na podstawie jego ID.
         """
         post = mongo.db.posts.find_one({"_id": post_id})
+        if post is None: # Sprawdź, czy post o takim ID istnieje
+            self.post_doesnt_exist(post_id)
         return post
 
     def check_if_can_view(self, key, post_id):
@@ -174,9 +176,9 @@ class Post(Resource):
             Ta metoda sprawdza czy ten klucz dostępu pozwala na dostęp do tego posta.
         """
         user_id = Auth.get_user_id(key)
-        post = self.post_from_id(post_id)
+        post = self.get_post_from_id(post_id)
         if post["visibility"] == "private": # Jeśli post jest prywatny
-            if post["user_id"] == user_id:# or user_id in User.get_friends_list(post["user_id"]): # Tylko właściciel i jego przyjaciele mogą go widzieć
+            if post["user_id"] == user_id or user_id in User.get_friends_list(post["user_id"]): # Tylko właściciel i jego przyjaciele mogą go widzieć
                 return 200
             else: # Jeśli użytkownik nie jest w tej grupie
                 abort(401, message=f"User {user_id} is not authorized to view post {post_id}") # Zwróć 401: "Unauthorized"
@@ -196,9 +198,7 @@ class Post(Resource):
             Zapytanie GET na ten endpoint służy do pobierania informacji o poście.
         """
         args = self.post_parser.parse_args() # Użyj parsera do przeczytania argumentów
-        post = self.post_from_id(args["_id"])
-        if post is None: # Sprawdź, czy post o takim ID istnieje
-            self.post_doesnt_exist(args["_id"])
+        post = self.get_post_from_id(args["_id"])
         if self.check_if_can_view(args["key"], args["_id"]): # Jeśli klucz dostępu pozwala na wyświetlenie posta
             return post # Zwróć posta
 
@@ -235,12 +235,10 @@ class Post(Resource):
         """
         args = self.post_parser.parse_args() # Użyj parsera do przeczytania argumentów
         user_id = Auth.get_user_id(args["key"]) # Zdobądź nazwę użytkownika
-        post = self.post_from_id(args["_id"])
-        if post is None: # Sprawdź, czy post o takim ID istnieje
-            self.post_doesnt_exist(post["_id"])
+        post = self.get_post_from_id(args["_id"])
         if user_id != post["user_id"]: # Jeśli użytkownik nie jest właścicielem
             abort(401, f"User {user_id} not authorized to update post {post['_id']}") # Zwróć 401: "Unauthorized"
-        mongo.db.posts.update_one({"_id": post["_id"], "$set": {"content": args["content"], "visibility": args["visibility"]}}) # Zaktualizuj dane posta
+        mongo.db.posts.update_one({"_id": post["_id"]}, {"$set": {"content": args["content"], "visibility": args["visibility"]}}) # Zaktualizuj dane posta
         return 200
 
     def delete(self):
@@ -250,9 +248,7 @@ class Post(Resource):
         """
         args = self.post_parser.parse_args() # Użyj parsera do przeczytania argumentów
         user_id = Auth.get_user_id(args["key"]) # Zdobądź nazwę użytkownika
-        post = self.post_from_id(args["_id"])
-        if post is None: # Sprawdź, czy post o takim ID istnieje
-            self.post_doesnt_exist(post["_id"])
+        post = self.get_post_from_id(args["_id"])
         if user_id != post["_id"]: # Jeśli użytkownik nie jest właścicielem
             abort(401, f"User {user_id} not authorized to delete post {post['_id']}") # Zwróć 401: "Unauthorized"
         mongo.db.posts.delete_one({"_id": post["_id"]}) # Usuń posta
@@ -260,10 +256,97 @@ class Post(Resource):
 
 
 
+class User(Resource):
+    """
+        Klasa zawierająca funkcje związane z informacjami o użytkownikach.
+    """
+
+    user_parser = reqparse.RequestParser() # Inicjalizacja parsera
+    user_parser.add_argument("action")
+    user_parser.add_argument("_id")
+    user_parser.add_argument("name")
+    user_parser.add_argument("birthday")
+    user_parser.add_argument("gender")
+    user_parser.add_argument("key")
+
+    @staticmethod
+    def get_user_from_id(user_id):
+        """
+            Ta metoda wyszukuje dane użytkownika na podstawie jego ID
+        """
+        user = mongo.db.users.find_one({"_id": user_id})
+        if user is None: # Sprawdź, czy post o takim ID istnieje
+            User.user_doesnt_exist(user_id)
+        return user
+    
+    @staticmethod
+    def user_doesnt_exist(user_id):
+        """
+            Ta metoda zwraca 404: "Not Found".
+            Jest to po prostu skrót, by sobie oszczędzić pisania.
+        """
+        abort(404, message=f"User {user_id} doesn't exist!")
+
+    @staticmethod
+    def get_friends_list(user_id):
+        """
+            Ta metoda zwraca listę przyjaciół użytkownika
+        """
+        user = User.get_user_from_id(user_id)
+        friends_list = user["friends_list"]
+        return friends_list
+        
+    def get(self):
+        """
+            Ta metoda obsługuje zapytanie HTTP GET na endpoint użytkowników.
+            Zwraca podstawowe informacje o użytkowniku.
+        """
+        args = self.user_parser.parse_args() # Użyj parsera do przeczytania argumentów
+        user = User.get_user_from_id(args["_id"])
+        return {"name": user["name"]}
+
+    def post(self):
+        """
+            Ta metoda obsługuje zapytanie HTTP POST na endpoint użytkowników.
+            Służy do obsługi znajomych.
+        """
+        args = self.user_parser.parse_args() # Użyj parsera do przeczytania argumentów
+
+        if args["action"] == "add_friend": # Jeśli zapytanie to prośba o dadanie przyjaciela
+            user = Auth.get_user_id(args["key"])
+            friend = args["_id"]
+            friends_list = User.get_friends_list(user)
+            friends_list.append(friend) # Dodaj ID przyjaciela do listy przyjaciół
+            mongo.db.users.update_one({"_id": user}, {"$set": {"friends_list": friends_list}}) # I zaktualizuj to w bazie
+
+        if args["action"] == "remove_friend": # Jeśli zapytanie to prośba o usunięcie przyjaciela
+            user = Auth.get_user_id(args["key"])
+            friend = args["_id"]
+            friends_list = User.get_friends_list(user)
+            if friend not in friends_list: # I jeśli znajduje się on na liście przyjaciół
+                abort(404, message=f"User {friend} is not a friend of user {user}") # (Jeśli tak nie jest, zwróć 404: "Not Found")
+            friends_list.remove(friend) # Usuń go z listy przyjaciół
+            mongo.db.users.update_one({"_id": user}, {"$set": {"friends_list": friends_list}}) # I zaktualizuj to w bazie
+            
+
+    def update(self):
+        """
+            Ta metoda obsługuje zapytanie HTTP UPDATE na endpoint użytkowników.
+            Zapytanie UPDATE służy do modyfikowania informacji o użytkowniku
+        """
+        args = self.user_parser.parse_args() # Użyj parsera do przeczytania argumentów
+        user = self.get_user_from_id(args["_id"])
+        if Auth.get_user_id(args["key"]) != args["_id"]: # Jeśli właściciel klucza się nie zgadza
+            abort(401, f"User {Auth.get_user_id(args['key'])} not authorized to update user {args['_id']}") # Zwróć 401: "Unauthorized"
+        mongo.db.users.update_one({"_id": args["_id"]}, {"$set": {"name": args["name"], "brithday": args["birthday"], "gender": args["gender"], "friends_list": []}}) # Zaktualizuj dane użytkownika
+        return 200
+
+
 # Dodanie endpointów i przypisanie im klas
 
 api.add_resource(Auth, "/auth")
 api.add_resource(Post, "/post")
+api.add_resource(User, "/user")
 
 # Uruchomienie serwera deweloperskiego, jeśli moduł jest uruchomiony jako skrypt
 
